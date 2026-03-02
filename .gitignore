@@ -1,0 +1,13 @@
+node_modules
+.DS_Store
+dist
+dist-ssr
+cache
+.idea
+.vscode
+.obsidian
+.env
+dataset.json
+
+__pycache__/
+AGENTS.md
