@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import { waitUntil } from '@vercel/functions';
+import fs from 'fs';
+import path from 'path';
 
 const CORP_ID     = process.env.WXWORK_CORP_ID;
 const AGENT_ID    = process.env.WXWORK_AGENT_ID;
@@ -7,13 +9,12 @@ const CORP_SECRET = process.env.WXWORK_SECRET;
 const WX_TOKEN    = process.env.WXWORK_TOKEN;
 const WX_AES_KEY  = Buffer.from((process.env.WXWORK_AES_KEY || '') + '=', 'base64');
 
-const SUPABASE_URL    = process.env.SUPABASE_URL;
-const SUPABASE_KEY    = process.env.SUPABASE_KEY;
 const SILICONFLOW_KEY = process.env.SILICONFLOW_KEY;
 
 // VPS nginx 代理地址，所有发往企业微信的请求都走这里
 const VPS_PROXY = 'http://49.233.85.74:8080';
 
+/** ===================== 工具函数：企业微信解密/校验 ===================== */
 function verifySignature(signature, timestamp, nonce, data = '') {
   const str = [WX_TOKEN, timestamp, nonce, data].sort().join('');
   return crypto.createHash('sha1').update(str).digest('hex') === signature;
@@ -44,6 +45,7 @@ function getRawBody(req) {
   });
 }
 
+/** ===================== 企业微信：token + 发送 ===================== */
 async function getAccessToken() {
   const res = await fetch(`${VPS_PROXY}/cgi-bin/gettoken?corpid=${CORP_ID}&corpsecret=${CORP_SECRET}`);
   const data = await res.json();
@@ -71,12 +73,11 @@ async function sendMessageWithToken(token, toUser, content) {
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
-
 function randomInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// === 过滤不可执行占位符 / 方括号表情 ===
+/** ===================== 输出过滤/解析/挡板 ===================== */
 const BAD_TOKENS = new Set([
   '[动画表情]', '[表情]', '[图片]', '[语音]', '[视频]', '[文件]',
   '[位置]', '[名片]', '[链接]', '[红包]', '[转账]'
@@ -87,11 +88,14 @@ function cleanBubble(s) {
   let t = String(s).trim();
   if (!t) return '';
   if (BAD_TOKENS.has(t)) return '';
-  // 去掉类似 [捂脸] 这种方括号表情（你也可以改成映射 emoji）
+
+  // 去掉类似 [捂脸] [偷笑] 等
   t = t.replace(/\[[^\]]{1,12}\]/g, '').trim();
   if (!t) return '';
-  // 限制单条长度（防止变长文）
+
+  // 单条不要太长
   if (t.length > 60) t = t.slice(0, 60);
+
   return t;
 }
 
@@ -114,17 +118,39 @@ function parseMessagesFromModel(text) {
 function qualityGuard(messages) {
   if (!messages || messages.length === 0) return false;
   if (messages.length > 4) return false;
+
+  // 去重（防复读）
+  const uniq = [];
+  const seen = new Set();
+  for (const m of messages) {
+    if (!seen.has(m)) {
+      uniq.push(m);
+      seen.add(m);
+    }
+  }
+  messages.length = 0;
+  messages.push(...uniq);
+
   const totalLen = messages.reduce((a, b) => a + b.length, 0);
   if (totalLen > 160) return false;
 
   const joined = messages.join('\n');
-  // 反 AI 味硬挡（你可以继续加）
   const banned = ['首先', '其次', '总的来说', '综上', '建议', '步骤', '方案', '总结', '你可以尝试'];
   if (banned.some(w => joined.includes(w))) return false;
 
   return true;
 }
 
+async function sendBubbles(token, userId, messages) {
+  for (let i = 0; i < messages.length; i++) {
+    await sendMessageWithToken(token, userId, messages[i]);
+    if (i !== messages.length - 1) {
+      await sleep(randomInt(350, 1200));
+    }
+  }
+}
+
+/** ===================== SiliconFlow：embedding + chat ===================== */
 async function getEmbedding(text) {
   const res = await fetch('https://api.siliconflow.cn/v1/embeddings', {
     method: 'POST',
@@ -132,26 +158,74 @@ async function getEmbedding(text) {
     body: JSON.stringify({ model: 'BAAI/bge-m3', input: text.slice(0, 2000), encoding_format: 'float' })
   });
   const data = await res.json();
+  if (!data?.data?.[0]?.embedding) {
+    throw new Error(`Embedding failed: ${JSON.stringify(data).slice(0, 400)}`);
+  }
   return data.data[0].embedding;
 }
 
-// === 从“你的历史回复库”检索 exemplars ===
-// 需要 Supabase RPC：match_replies（或你复用 match_documents 也行）
-async function searchReplies(embedding) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_replies`, {
-    method: 'POST',
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query_embedding: embedding, match_count: 8, match_threshold: 0.5 })
-  });
-  return res.json();
+/** ===================== 本地“回复库”向量检索（纯JS暴力版） ===================== */
+/**
+ * 需要在仓库里放：reply_index/vectors.json
+ * 格式：[{ text: "...", embedding: [float...1024] }, ...]
+ */
+let _replyVectors = null; // [{text, embedding}]
+function loadReplyVectorsOnce() {
+  if (_replyVectors) return;
+  const p = path.join(process.cwd(), 'reply_index', 'vectors.json');
+  const raw = fs.readFileSync(p, 'utf-8');
+  const arr = JSON.parse(raw);
+  _replyVectors = Array.isArray(arr) ? arr : [];
+  console.log('[LOCAL VECTORS] loaded', _replyVectors.length);
 }
 
+function dot(a, b) {
+  let s = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) s += a[i] * b[i];
+  return s;
+}
+function norm(a) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * a[i];
+  return Math.sqrt(s) || 1;
+}
+function cosineSim(a, b) {
+  return dot(a, b) / (norm(a) * norm(b));
+}
+
+function searchRepliesLocal(queryEmbedding, k = 8) {
+  loadReplyVectorsOnce();
+  if (!_replyVectors.length) return [];
+
+  // 维护一个小 topK（数组长度<=k）
+  const top = [];
+  for (let i = 0; i < _replyVectors.length; i++) {
+    const item = _replyVectors[i];
+    const emb = item.embedding;
+    if (!emb || !Array.isArray(emb)) continue;
+
+    const score = cosineSim(queryEmbedding, emb);
+
+    if (top.length < k) {
+      top.push({ score, content: item.text });
+      if (top.length === k) top.sort((x, y) => x.score - y.score); // 小到大
+    } else if (score > top[0].score) {
+      top[0] = { score, content: item.text };
+      top.sort((x, y) => x.score - y.score);
+    }
+  }
+
+  // 由高到低返回
+  return top.sort((a, b) => b.score - a.score).map(x => ({ content: x.content }));
+}
+
+/** ===================== 生成多气泡短回复 ===================== */
 async function generateReplyBubbles(question, exemplars) {
   const exText = (exemplars && exemplars.length > 0)
     ? exemplars.map((c, i) => `示例${i + 1}：\n${c.content}`).join('\n\n')
     : '';
 
-  // 核心：强制输出 JSON messages[]，短、碎、像微信，别讲道理
   const prompt = `你在企业微信里扮演“吹雨本人”和对方聊天（闲聊为主，不要像客服/老师）。
 必须输出严格JSON，格式如下：
 {"messages":["...","..."]}
@@ -178,25 +252,16 @@ ${question}
       model: 'deepseek-ai/DeepSeek-V3',
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 256,
-      temperature: 0.8
+      temperature: 0.85
     })
   });
+
   const data = await res.json();
   const raw = data?.choices?.[0]?.message?.content ?? '';
   return parseMessagesFromModel(raw);
 }
 
-async function sendBubbles(token, userId, messages) {
-  // 逐条发送，模拟人类断断续续
-  for (let i = 0; i < messages.length; i++) {
-    await sendMessageWithToken(token, userId, messages[i]);
-    // 最后一条就不等太久
-    if (i !== messages.length - 1) {
-      await sleep(randomInt(350, 1200));
-    }
-  }
-}
-
+/** ===================== Vercel handler ===================== */
 export default async function handler(req, res) {
   const urlObj = new URL(req.url, `https://${req.headers.host}`);
   const p = urlObj.searchParams;
@@ -235,8 +300,8 @@ export default async function handler(req, res) {
       waitUntil((async () => {
         const token = await getAccessToken();
 
-        // 可选：先发一句“在打字”式的确认（你也可以删掉）
-        await sendMessageWithToken(token, userId, '等我想想😂');
+        // 可选：先发一句“在打字”式确认
+        // await sendMessageWithToken(token, userId, 'emm');
 
         let messages = [];
         try {
@@ -244,23 +309,19 @@ export default async function handler(req, res) {
           const embedding = await getEmbedding(content);
           console.log('[REPLY-RAG] embedding完成');
 
-          const exemplars = await searchReplies(embedding);
-          console.log('[REPLY-RAG] 检索完成，exemplars:', exemplars?.length);
+          const exemplars = searchRepliesLocal(embedding, 8);
+          console.log('[REPLY-RAG] 本地检索完成，exemplars:', exemplars?.length);
 
-          // 生成多条短回复（你也可以后续加 n_cand 多候选+评分，这里先单次生成）
           messages = await generateReplyBubbles(content, exemplars);
           console.log('[REPLY-RAG] 生成完成 messages:', messages);
-
         } catch (err) {
           console.error('[REPLY-RAG ERROR]', err?.message || err);
         }
 
-        // 质量挡板：不合格就用安全短回复
         if (!qualityGuard(messages)) {
-          messages = ['我有点懵😂你再说清楚点'];
+          messages = ['我有点懵,你再说清楚点'];
         }
 
-        // 逐条发送
         await sendBubbles(token, userId, messages);
       })());
     }
