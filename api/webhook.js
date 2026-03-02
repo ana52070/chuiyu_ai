@@ -11,8 +11,58 @@ const WX_AES_KEY  = Buffer.from((process.env.WXWORK_AES_KEY || '') + '=', 'base6
 
 const SILICONFLOW_KEY = process.env.SILICONFLOW_KEY;
 
-// VPS nginx 代理地址，所有发往企业微信的请求都走这里
-const VPS_PROXY = 'http://49.233.85.74:8080';
+// ✅ 建议加回环境变量，默认走你原来的 8080
+const VPS_PROXY = process.env.VPS_PROXY_URL || 'http://49.233.85.74:8080';
+
+/** ===================== 轻量上下文：内存滑动窗口（best-effort） ===================== */
+/**
+ * 注意：Vercel serverless 下这是“尽力而为”的记忆（实例切换会丢）。
+ * 想稳定记忆：后续可换 Vercel KV / Upstash Redis。
+ */
+const CONV_TTL_MS = 1000 * 60 * 60 * 6; // 6小时不说话就清
+const CONV_MAX_ITEMS = 12;              // 滑动窗口：最近12条（含你和对方）
+const conversations = new Map();        // userId -> { items: [{role,text,ts}], updatedAt }
+
+function nowMs() { return Date.now(); }
+
+function getConv(userId) {
+  const v = conversations.get(userId);
+  if (!v) return null;
+  if (nowMs() - v.updatedAt > CONV_TTL_MS) {
+    conversations.delete(userId);
+    return null;
+  }
+  return v;
+}
+
+function appendConv(userId, role, text) {
+  if (!userId || !text) return;
+  let v = getConv(userId);
+  if (!v) v = { items: [], updatedAt: nowMs() };
+
+  v.items.push({ role, text, ts: nowMs() });
+  v.updatedAt = nowMs();
+
+  // 滑动窗口裁剪
+  if (v.items.length > CONV_MAX_ITEMS) {
+    v.items = v.items.slice(v.items.length - CONV_MAX_ITEMS);
+  }
+  conversations.set(userId, v);
+
+  // 顺便做个小清理（避免 map 越来越大）
+  if (conversations.size > 200) {
+    for (const [k, val] of conversations.entries()) {
+      if (nowMs() - val.updatedAt > CONV_TTL_MS) conversations.delete(k);
+    }
+  }
+}
+
+function formatContext(userId) {
+  const v = getConv(userId);
+  if (!v || !v.items.length) return '';
+  // 最近的对话上下文
+  return v.items.map(it => (it.role === 'user' ? `对方：${it.text}` : `我：${it.text}`)).join('\n');
+}
 
 /** ===================== 工具函数：企业微信解密/校验 ===================== */
 function verifySignature(signature, timestamp, nonce, data = '') {
@@ -70,12 +120,8 @@ async function sendMessageWithToken(token, toUser, content) {
   return result;
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-function randomInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
 /** ===================== 输出过滤/解析/挡板 ===================== */
 const BAD_TOKENS = new Set([
@@ -89,18 +135,17 @@ function cleanBubble(s) {
   if (!t) return '';
   if (BAD_TOKENS.has(t)) return '';
 
-  // 去掉类似 [捂脸] [偷笑] 等
+  // 去掉 [捂脸] 等
   t = t.replace(/\[[^\]]{1,12}\]/g, '').trim();
   if (!t) return '';
 
-  // 单条不要太长
+  // 单条不太长
   if (t.length > 60) t = t.slice(0, 60);
 
   return t;
 }
 
 function parseMessagesFromModel(text) {
-  // 期望严格 JSON：{"messages":[...]}
   try {
     const obj = JSON.parse(text);
     const arr = obj?.messages;
@@ -110,7 +155,6 @@ function parseMessagesFromModel(text) {
     }
   } catch (e) {}
 
-  // fallback：按行切
   const lines = String(text).split('\n').map(x => cleanBubble(x)).filter(Boolean);
   return lines.slice(0, 3);
 }
@@ -119,7 +163,7 @@ function qualityGuard(messages) {
   if (!messages || messages.length === 0) return false;
   if (messages.length > 4) return false;
 
-  // 去重（防复读）
+  // 去重
   const uniq = [];
   const seen = new Set();
   for (const m of messages) {
@@ -141,12 +185,48 @@ function qualityGuard(messages) {
   return true;
 }
 
-async function sendBubbles(token, userId, messages) {
+/**
+ * ✅ 让句数不固定：1~3
+ * - 模型经常给 3 条的话，我们做一个轻随机截断
+ * - 保留“自然”优先：如果第一条很短就可能只发1条
+ */
+function maybeTrimTo1to3(messages) {
+  if (!messages || messages.length === 0) return messages;
+
+  // 如果就 1 条，直接返回
+  if (messages.length === 1) return messages;
+
+  // 让它不要每次都 3 条：用概率截断
+  // 50%：保留2条；25%：保留1条；25%：保留3条
+  const r = Math.random();
+  let keep = 3;
+  if (r < 0.25) keep = 1;
+  else if (r < 0.75) keep = 2;
+  else keep = Math.min(3, messages.length);
+
+  return messages.slice(0, keep);
+}
+
+/** ===================== 更像人的发送节奏 ===================== */
+/**
+ * - 第一条前：短等待（像在打字）
+ * - 后续每条：按“字数”计算打字时间 + 抖动
+ */
+async function sendBubblesHuman(token, userId, messages) {
+  // 第一条稍微快一点
+  await sleep(randomInt(250, 900));
+
   for (let i = 0; i < messages.length; i++) {
-    await sendMessageWithToken(token, userId, messages[i]);
-    if (i !== messages.length - 1) {
-      await sleep(randomInt(350, 1200));
-    }
+    const msg = messages[i];
+    await sendMessageWithToken(token, userId, msg);
+
+    // 最后一条不等
+    if (i === messages.length - 1) break;
+
+    // 打字时间：跟长度相关（更像人）
+    const typing = Math.min(2600, 350 + msg.length * randomInt(60, 110));
+    const jitter = randomInt(200, 900);
+    await sleep(typing + jitter);
   }
 }
 
@@ -165,10 +245,6 @@ async function getEmbedding(text) {
 }
 
 /** ===================== 本地“回复库”向量检索（纯JS暴力版） ===================== */
-/**
- * 需要在仓库里放：reply_index/vectors.json
- * 格式：[{ text: "...", embedding: [float...1024] }, ...]
- */
 let _replyVectors = null; // [{text, embedding}]
 function loadReplyVectorsOnce() {
   if (_replyVectors) return;
@@ -198,7 +274,6 @@ function searchRepliesLocal(queryEmbedding, k = 8) {
   loadReplyVectorsOnce();
   if (!_replyVectors.length) return [];
 
-  // 维护一个小 topK（数组长度<=k）
   const top = [];
   for (let i = 0; i < _replyVectors.length; i++) {
     const item = _replyVectors[i];
@@ -209,38 +284,43 @@ function searchRepliesLocal(queryEmbedding, k = 8) {
 
     if (top.length < k) {
       top.push({ score, content: item.text });
-      if (top.length === k) top.sort((x, y) => x.score - y.score); // 小到大
+      if (top.length === k) top.sort((x, y) => x.score - y.score);
     } else if (score > top[0].score) {
       top[0] = { score, content: item.text };
       top.sort((x, y) => x.score - y.score);
     }
   }
 
-  // 由高到低返回
   return top.sort((a, b) => b.score - a.score).map(x => ({ content: x.content }));
 }
 
-/** ===================== 生成多气泡短回复 ===================== */
-async function generateReplyBubbles(question, exemplars) {
+/** ===================== 生成多气泡短回复（带上下文） ===================== */
+async function generateReplyBubbles(userId, question, exemplars) {
   const exText = (exemplars && exemplars.length > 0)
     ? exemplars.map((c, i) => `示例${i + 1}：\n${c.content}`).join('\n\n')
     : '';
+
+  const ctx = formatContext(userId);
 
   const prompt = `你在企业微信里扮演“吹雨本人”和对方聊天（闲聊为主，不要像客服/老师）。
 必须输出严格JSON，格式如下：
 {"messages":["...","..."]}
 
 硬规则：
-- 默认 1~3 条气泡；每条尽量短（5~20字常见），最多60字。
+- 回复可以只发1条，也可以2~3条；不要为了凑数硬发满3条。
+- 每条尽量短（5~20字常见），最多60字。
 - 不要长文，不要说教，不要写“首先/其次/建议/综上/方案/步骤/总结”。
 - 不要输出任何占位符或动作描述：例如[动画表情]/[图片]/[语音]/[xx]。
 - 不确定就直说“不太确定/不知道”，不要装懂。
 - 不要连续复读同一句。
 
+对话上下文（最近几句，供你参考，不要照抄）：
+${ctx || '（无）'}
+
 下面是“吹雨以前类似场景怎么回”的示例（只学语气和节奏，不要照抄内容）：
 ${exText || '（无）'}
 
-对方发来：
+对方刚刚发来：
 ${question}
 
 现在请按吹雨的微信风格回复（只输出JSON，不要输出其它任何文字）。`;
@@ -297,11 +377,14 @@ export default async function handler(req, res) {
     console.log('[MSG] userId:', userId, 'content:', content);
 
     if (msgType === 'text' && userId && content) {
+      // ✅ 先把“对方消息”写入上下文（这样模型能看到上一句）
+      appendConv(userId, 'user', content);
+
       waitUntil((async () => {
         const token = await getAccessToken();
 
-        // 可选：先发一句“在打字”式确认
-        // await sendMessageWithToken(token, userId, 'emm');
+        // 可选：先发一句“在打字”式确认（你不想要也可以删）
+        // await sendMessageWithToken(token, userId, '等我想想😂');
 
         let messages = [];
         try {
@@ -312,17 +395,28 @@ export default async function handler(req, res) {
           const exemplars = searchRepliesLocal(embedding, 8);
           console.log('[REPLY-RAG] 本地检索完成，exemplars:', exemplars?.length);
 
-          messages = await generateReplyBubbles(content, exemplars);
-          console.log('[REPLY-RAG] 生成完成 messages:', messages);
+          messages = await generateReplyBubbles(userId, content, exemplars);
+          console.log('[REPLY-RAG] 原始生成 messages:', messages);
+
+          // ✅ 让句数不固定（1~3）
+          messages = maybeTrimTo1to3(messages);
+          console.log('[REPLY-RAG] 裁剪后 messages:', messages);
+
         } catch (err) {
           console.error('[REPLY-RAG ERROR]', err?.message || err);
         }
 
         if (!qualityGuard(messages)) {
-          messages = ['我有点懵,你再说清楚点'];
+          messages = ['我有点懵😂你再说清楚点'];
         }
 
-        await sendBubbles(token, userId, messages);
+        // ✅ 把“我方发送内容”写入上下文（多条逐条写）
+        for (const m of messages) {
+          appendConv(userId, 'assistant', m);
+        }
+
+        // ✅ 更像人的分段发送节奏
+        await sendBubblesHuman(token, userId, messages);
       })());
     }
 
